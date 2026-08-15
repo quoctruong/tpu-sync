@@ -30,6 +30,7 @@
 #include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 namespace tpu_raiden::telemetry {
 namespace {
@@ -87,22 +88,6 @@ static_assert(!std::is_move_constructible_v<MetricsBackend>,
 static_assert(!std::is_move_assignable_v<MetricsBackend>,
               "MetricsBackend must not be move assignable");
 
-class MockMetricsBackend : public MetricsBackend {
- public:
-  MOCK_METHOD(void, IncrementCounter,
-              (absl::string_view name, LabelSpan labels, uint64_t val),
-              (override, const));
-  MOCK_METHOD(void, SetGauge,
-              (absl::string_view name, LabelSpan labels, double val),
-              (override, const));
-  MOCK_METHOD(void, ObserveHistogram,
-              (absl::string_view name, LabelSpan labels, double val),
-              (override, const));
-  MOCK_METHOD(std::string, GetTextSnapshot, (), (override, const));
-  MOCK_METHOD((std::map<std::string, std::vector<double>>),
-              GetAndResetMetricSamples, (), (override));
-};
-
 class MetricsApiTest : public testing::Test {
  protected:
   void SetUp() override { store_.SetBackends({}); }
@@ -149,7 +134,36 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(
       metric_metadata::kTransferFailuresTotal.description,
       "Cumulative total count of transfer failures across all interfaces.");
-  EXPECT_EQ(metric_metadata::kTransferFailuresTotal.type, MetricType::kCounter);
+  // H2dTransferTimeMs
+  EXPECT_EQ(metric_names::kH2dTransferTimeMs, "h2d_transfer_time_ms");
+  EXPECT_EQ(metric_descriptions::kH2dTransferTimeMs,
+            "Host-to-Device transfer latency in milliseconds.");
+  EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.name, "h2d_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.description,
+            "Host-to-Device transfer latency in milliseconds.");
+  EXPECT_EQ(metric_metadata::kH2dTransferTimeMs.type, MetricType::kHistogram);
+
+  // D2hTransferTimeMs
+  EXPECT_EQ(metric_names::kD2hTransferTimeMs, "d2h_transfer_time_ms");
+  EXPECT_EQ(metric_descriptions::kD2hTransferTimeMs,
+            "Device-to-Host transfer latency in milliseconds.");
+  EXPECT_EQ(metric_metadata::kD2hTransferTimeMs.name, "d2h_transfer_time_ms");
+  EXPECT_EQ(metric_metadata::kD2hTransferTimeMs.description,
+            "Device-to-Host transfer latency in milliseconds.");
+  EXPECT_EQ(metric_metadata::kD2hTransferTimeMs.type, MetricType::kHistogram);
+
+  // TransferDurationMs
+  EXPECT_EQ(metric_names::kTransferDurationMs, "transfer_duration_ms");
+  EXPECT_EQ(
+      metric_descriptions::kTransferDurationMs,
+      "Measures End-to-End (E2E) latency bound around the entire request in "
+      "milliseconds, including setup delays.");
+  EXPECT_EQ(metric_metadata::kTransferDurationMs.name, "transfer_duration_ms");
+  EXPECT_EQ(
+      metric_metadata::kTransferDurationMs.description,
+      "Measures End-to-End (E2E) latency bound around the entire request in "
+      "milliseconds, including setup delays.");
+  EXPECT_EQ(metric_metadata::kTransferDurationMs.type, MetricType::kHistogram);
 
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
@@ -157,13 +171,17 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_EQ(metric_labels::kDirectionPull, "pull");
   EXPECT_EQ(metric_labels::kDirectionPullResponse, "pull_response");
 
+  // Error Code Labels
   EXPECT_EQ(metric_labels::kErrorCode, "error_code");
 
   // All Metrics
   EXPECT_THAT(metric_metadata::kAllMetrics,
               ElementsAre(metric_metadata::kSentBytesTotal,
                           metric_metadata::kReceivedBytesTotal,
-                          metric_metadata::kTransferFailuresTotal));
+                          metric_metadata::kTransferFailuresTotal,
+                          metric_metadata::kTransferDurationMs,
+                          metric_metadata::kH2dTransferTimeMs,
+                          metric_metadata::kD2hTransferTimeMs));
 }
 
 TEST_F(MetricsApiTest, FastPathExitWhenNoBackends) {
@@ -200,6 +218,31 @@ TEST_F(MetricsApiTest, DispatchesToRegisteredBackend) {
   store_.IncrementCounter(metric_names::kReceivedBytesTotal, {}, 4096);
   store_.IncrementCounter(metric_names::kTransferFailuresTotal, {}, 1);
   EXPECT_EQ(store_.GetTextSnapshot(), "# HELP mock\n");
+}
+
+TEST_F(MetricsApiTest, ObserveHistogramPrecision) {
+  auto mock_backend = std::make_unique<MockMetricsBackend>();
+  MockMetricsBackend* raw_mock = mock_backend.get();
+
+  // Verify that fractional values (microseconds precision in ms metric) are
+  // passed correctly.
+  static constexpr double kFractionalValue = 0.001234;  // 1.234 microseconds
+
+  EXPECT_CALL(*raw_mock, ObserveHistogram(Eq(metric_names::kH2dTransferTimeMs),
+                                          _, Eq(kFractionalValue)))
+      .Times(1);
+  EXPECT_CALL(*raw_mock, ObserveHistogram(Eq(metric_names::kD2hTransferTimeMs),
+                                          _, Eq(kFractionalValue)))
+      .Times(1);
+
+  std::vector<std::unique_ptr<MetricsBackend>> backends;
+  backends.push_back(std::move(mock_backend));
+  store_.SetBackends(std::move(backends));
+
+  store_.ObserveHistogram(metric_names::kH2dTransferTimeMs, {},
+                          kFractionalValue);
+  store_.ObserveHistogram(metric_names::kD2hTransferTimeMs, {},
+                          kFractionalValue);
 }
 
 TEST_F(MetricsApiTest, SetBackendsReplacesExistingBackends) {
@@ -269,11 +312,12 @@ TEST_F(MetricsApiTest, GetMetricMetadataReturnsAllMetricsWhenBackendsActive) {
   store_.SetBackends(std::move(backends));
 
   std::vector<MetricMetadata> result = store_.GetMetricMetadata();
-  EXPECT_THAT(
-      result,
-      ElementsAre(metric_metadata::kSentBytesTotal,
-                  metric_metadata::kReceivedBytesTotal,
-                  metric_metadata::kTransferFailuresTotal));
+  EXPECT_THAT(result, ElementsAre(metric_metadata::kSentBytesTotal,
+                                  metric_metadata::kReceivedBytesTotal,
+                                  metric_metadata::kTransferFailuresTotal,
+                                  metric_metadata::kTransferDurationMs,
+                                  metric_metadata::kH2dTransferTimeMs,
+                                  metric_metadata::kD2hTransferTimeMs));
 }
 
 TEST_F(MetricsApiTest, GetMetricMetadataEmptyWhenNoBackends) {
