@@ -32,10 +32,12 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
+#include "tpu_sync/transport/transport_adapter.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -110,6 +112,11 @@ class BlockTransport final {
   absl::Status PushBuffers(const std::vector<BufferPushTask>& tasks,
                            int parallelism, uint64_t uuid);
 
+  // Builds a Request descriptor for a single buffer push (Op 5).
+  static absl::StatusOr<Request> BuildBufferRequest(
+      size_t buffer_id, size_t dst_shard_idx, size_t dst_offset_bytes,
+      const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid = 0);
+
   // Registers the expected number of chunks for the given `uuid`.
   // If the completed number of chunks is equal to the expected, it triggers
   // the delegate's `OnDataReceived()` H2D callback.
@@ -151,6 +158,21 @@ class BlockTransport final {
                       std::vector<absl::Status>& statuses,
                       MajorOrder major_order, uint64_t uuid = 0,
                       int layer_idx = -1, int parallelism = 1);
+
+  // Builds a batch of Requests for block transfer.
+  absl::StatusOr<std::vector<Request>> BuildBlockRequests(
+      absl::string_view peer, size_t block_offset, size_t block_count,
+      const std::vector<int>& src_block_ids,
+      const std::vector<int>& dst_block_ids, MajorOrder major_order,
+      uint64_t uuid = 0, int layer_idx = -1, int parallelism = 1);
+
+  absl::Status ProcessSocketPush(absl::string_view peer,
+                                 absl::string_view local_ip,
+                                 absl::Span<const Request> requests,
+                                 const std::vector<int>& src_block_ids,
+                                 const std::vector<int>& dst_block_ids,
+                                 size_t block_offset,
+                                 std::vector<int>& allocated_ids);
 
   void H2hReadWorker(int stream_idx, absl::string_view peer,
                      absl::string_view local_ip, size_t local_block_offset,

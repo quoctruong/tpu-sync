@@ -38,6 +38,12 @@ cc_library(
 )
 
 cc_library(
+    name = "transport_adapter",
+    hdrs = ["transport_adapter.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "block_transport",
     srcs = ["block_transport.cc"],
     hdrs = ["block_transport.h"],
@@ -50,6 +56,7 @@ cc_library(
     deps = [
         ":block_transport_delegate",
         ":buffer_push_task",
+        ":transport_adapter",
         "//tpu_sync/core:status_macros",
         "//tpu_sync/core:tsl_platform_headers",
         "//tpu_sync/telemetry:metrics_api",

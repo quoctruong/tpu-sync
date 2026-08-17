@@ -37,6 +37,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/transport_adapter.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -86,14 +87,6 @@ class RawBufferTransport final {
                           size_t dst_shard_idx, size_t dst_offset_bytes,
                           size_t size_bytes);
 
-  // Synchronously pushes a buffer identified by `buffer_id` to the remote
-  // `peer`, by sending out a `kOpBufferPush ChunkHeader` followed by the data.
-  // It waits for a one-byte ack from the `peer` before it returns.
-  absl::Status PushBuffer(absl::string_view peer, size_t buffer_id,
-                          size_t dst_shard_idx, size_t dst_offset_bytes,
-                          const uint8_t* data_ptr, size_t size_bytes,
-                          uint64_t uuid);
-
   // Pushes a vector of buffers to multiple peers using `PushBatch()`.
   absl::Status PushBuffers(const std::vector<BufferPushTask>& tasks,
                            int parallelism, uint64_t uuid);
@@ -111,6 +104,10 @@ class RawBufferTransport final {
 
   // Drops receive-progress counters belonging to the give `uuid`.
   void ForgetPushProgress(uint64_t uuid);
+
+  // Transmits a single buffer push request (Op 5) over TCP socket.
+  absl::Status ProcessSocketBufferPush(absl::string_view peer,
+                                       const Request& request);
 
  private:
   // Pushes a batch of buffers to the remote `peer`, by sending out a

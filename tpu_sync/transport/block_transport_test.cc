@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>  // NOLINT
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include <string>
 #include <thread>  // NOLINT
 #include <tuple>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -51,8 +53,11 @@ namespace transport {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::Each;
+using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::Not;
+using ::testing::Pointwise;
 
 constexpr absl::Duration kMetricPollingTimeout = absl::Seconds(5);
 constexpr absl::Duration kMetricPollingInterval = absl::Milliseconds(10);
@@ -997,6 +1002,150 @@ TEST(BlockTransportTest, NoTransferFailuresTelemetryOnSuccess) {
       "tpu_raiden_transfer_failures_total{";
   EXPECT_THAT(WaitForMetricSnapshot(kNotExpectedError),
               Not(HasSubstr(kNotExpectedError)));
+}
+
+TEST(BlockTransportTest, MultiShardPushBlockMajor) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 3;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+
+  ASSERT_OK(
+      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                      /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
+                      /*parallelism=*/1, MajorOrder::kBlockMajor, /*uuid=*/0,
+                      /*layer_idx=*/-1));
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
+TEST(BlockTransportTest, MultiShardPushLayerMajor) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 3;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+
+  ASSERT_OK(
+      sender.SyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                      /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
+                      /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+                      /*layer_idx=*/-1));
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
+TEST(BlockTransportTest, PushBufferCorrectness) {
+  constexpr size_t size = 64 * 1024;
+  MockDelegate src(size);
+  MockDelegate dst(size);
+
+  BlockTransport src_transport(&src, 0);
+  BlockTransport dst_transport(&dst, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  constexpr size_t kLen = 62 * 1024;
+  constexpr size_t kDstOffset = 512;
+  std::vector<uint8_t> push_payload(kLen);
+  for (size_t i = 0; i < kLen; ++i) {
+    push_payload[i] = static_cast<uint8_t>((i % 255) + 1);
+  }
+  const std::string dst_addr =
+      absl::StrCat("localhost:", dst_transport.local_port());
+  const auto push_res = src_transport.PushBuffer(
+      dst_addr, /*buffer_id=*/0, /*dst_shard_idx=*/0,
+      /*dst_offset_bytes=*/kDstOffset, push_payload.data(),
+      push_payload.size(), /*uuid=*/0);
+  EXPECT_OK(push_res) << push_res.message();
+
+  const uint8_t* dst_buf = dst.GetHostPointer(0, 0);
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf, kDstOffset), Each(Eq(0)));
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset, kLen),
+              Pointwise(Eq(), absl::MakeConstSpan(push_payload)));
+  EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset + kLen,
+                                  size - kDstOffset - kLen),
+              Each(Eq(0)));
+}
+
+TEST(BlockTransportTest, PollEINTRIsBenign) {
+  // Set up src/dst buffers.
+  constexpr size_t size = 4096;
+  MockDelegate src(size);
+  MockDelegate dst(size);
+
+  // Create two transports.
+  BlockTransport src_transport(&src, 0);
+  BlockTransport dst_transport(&dst, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Register a dummy signal handler.
+  signal(SIGUSR1, [](int) {});
+  // Send a signal to the process to interrupt some poll() calls with EINTR.
+  kill(getpid(), SIGUSR1);
+
+  // Perform a push to verify the connection worker didn't die.
+  const std::string dst_addr =
+      absl::StrCat("localhost:", dst_transport.local_port());
+  const std::vector<uint8_t> push_payload(1024, 0xAB);
+  constexpr size_t kDstOffset = 512;
+  const auto push_res = src_transport.PushBuffer(
+      dst_addr, /*buffer_id=*/0, /*dst_shard_idx=*/0,
+      /*dst_offset_bytes=*/kDstOffset, push_payload.data(),
+      push_payload.size(), /*uuid=*/0);
+  EXPECT_OK(push_res) << push_res.message();
 }
 
 }  // namespace

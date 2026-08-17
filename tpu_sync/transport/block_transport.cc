@@ -54,6 +54,7 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
 #include "tpu_sync/transport/peregrine/src/api/socket_util.h"
+#include "tpu_sync/transport/transport_adapter.h"
 
 ABSL_FLAG(size_t, raiden_transport_coalesce_window_bytes, 0,
           "Maximum size in bytes of the host-side coalescing buffer used "
@@ -886,87 +887,11 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
   return allocated_ids;
 }
 
-void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
-                                    absl::string_view local_ip,
-                                    size_t block_offset, size_t block_count,
-                                    const std::vector<int>& src_block_ids,
-                                    const std::vector<int>& dst_block_ids,
-                                    std::vector<int>& allocated_ids,
-                                    std::vector<absl::Status>& statuses,
-                                    MajorOrder major_order, uint64_t uuid,
-                                    int layer_idx, int parallelism) {
-  if (block_count > std::numeric_limits<uint32_t>::max()) {
-    statuses[stream_idx] = absl::OutOfRangeError("Block count exceeds uint32");
-    return;
-  }
-
-  auto status_or_fd = raw_transport_.conn_pool().Borrow(peer, local_ip);
-  if (!status_or_fd.ok()) {
-    statuses[stream_idx] = status_or_fd.status();
-    return;
-  }
-
-  const int fd = status_or_fd.value();
-  bool ok_to_pool = false;
-  auto fd_cleaner = absl::MakeCleanup([&] {
-    raw_transport_.conn_pool().Return(ok_to_pool, fd, peer, local_ip);
-  });
-
-  lib::ChunkHeader header = {};
-  header.version = 1;
-  header.op = static_cast<uint8_t>(dst_block_ids.empty() ? 1 : 6);
-  header.flags = static_cast<uint8_t>(major_order);
-  header.buffer_id = 0;
-  header.reserved = static_cast<uint16_t>(parallelism);
-  header.remote_id = static_cast<uint32_t>(block_delegate_->node_id());
-  header.local_id =
-      layer_idx == -1 ? 0xFFFF'FFFF : static_cast<uint32_t>(layer_idx);
-  header.count_or_size = static_cast<uint32_t>(block_count);
-  header.uuid = uuid;
-  const auto s_header = lib::SerializeChunkHeader(header);
-  absl::Status s = WriteExact(fd, s_header.data(), s_header.size());
-  if (!s.ok()) {
-    statuses[stream_idx] = s;
-    return;
-  }
-
-  if (header.op == 6) {
-    ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
-    s = WriteExact(fd, &dst_block_ids[block_offset], block_count * sizeof(int));
-    if (!s.ok()) {
-      statuses[stream_idx] = s;
-      return;
-    }
-    s = WriteExact(fd, &src_block_ids[block_offset], block_count * sizeof(int));
-    if (!s.ok()) {
-      statuses[stream_idx] = s;
-      return;
-    }
-    uint8_t ack = 0;
-    s = ReadExact(fd, &ack, 1);
-    if (!s.ok() || ack != 1) {
-      statuses[stream_idx] =
-          absl::InternalError("Explicit push destination handshake failed");
-      return;
-    }
-    for (size_t k = 0; k < block_count; ++k) {
-      allocated_ids[block_offset + k] = dst_block_ids[block_offset + k];
-    }
-  } else {
-    std::vector<int> stream_allocated_ids(block_count, 0);
-    s = ReadExact(fd, stream_allocated_ids.data(), block_count * sizeof(int));
-    if (!s.ok()) {
-      statuses[stream_idx] = s;
-      return;
-    }
-
-    for (size_t k = 0; k < block_count; ++k) {
-      ABSL_DCHECK_LT(block_offset + k, allocated_ids.size());
-      ABSL_DCHECK_LT(k, stream_allocated_ids.size());
-      allocated_ids[block_offset + k] = stream_allocated_ids[k];
-    }
-  }
-
+absl::StatusOr<std::vector<Request>> BlockTransport::BuildBlockRequests(
+    absl::string_view peer, size_t block_offset, size_t block_count,
+    const std::vector<int>& src_block_ids,
+    const std::vector<int>& dst_block_ids, MajorOrder major_order,
+    uint64_t uuid, int layer_idx, int parallelism) {
   std::vector<int> target_layers;
   if (layer_idx == -1) {
     target_layers.resize(block_delegate_->num_block_arrays());
@@ -975,8 +900,12 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
     target_layers = {layer_idx};
   }
 
-  uint64_t stream_bytes_sent = 0;
-  s = ForEachPayload(
+  std::vector<Request> requests;
+  const uint8_t socket_opcode =
+      static_cast<uint8_t>(dst_block_ids.empty() ? 1 : 6);
+
+  uint32_t request_id = 0;
+  absl::Status s = ForEachPayload(
       major_order, target_layers, block_delegate_->num_shards(), block_count,
       [&](size_t l, size_t sh, size_t k) -> absl::Status {
         ABSL_DCHECK_LT(block_offset + k, src_block_ids.size());
@@ -998,21 +927,128 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
         }
         RETURN_IF_ERROR(ValidateChunks(block_delegate_, l, sh, chunks));
 
-        uint32_t total_size = 0;
         for (const auto& chunk : chunks) {
-          total_size += chunk.size;
+          uint8_t* remote_ptr = (dst_id_val >= 0)
+                                    ? block_delegate_->GetBlockHostPointer(
+                                          l, sh, static_cast<int>(dst_id_val))
+                                    : nullptr;
+          requests.push_back(Request{
+              .socket_opcode = socket_opcode,
+              .laddr = chunk.ptr,
+              .raddr = remote_ptr,
+              .len = chunk.size,
+              .count_or_size = static_cast<uint32_t>(block_count),
+              .local_id = layer_idx == -1 ? 0xFFFF'FFFF
+                                          : static_cast<uint32_t>(layer_idx),
+              .remote_id = static_cast<uint32_t>(block_delegate_->node_id()),
+              .layer_idx = layer_idx,
+              .request_id = request_id,
+              .uuid = uuid,
+              .parallelism = parallelism,
+              .major_order = static_cast<uint8_t>(major_order),
+          });
         }
-
-        RETURN_IF_ERROR(WriteExact(fd, &total_size, sizeof(total_size)));
-        if (total_size > 0) {
-          RETURN_IF_ERROR(WriteVExact(fd, ToIovec(chunks)));
-          stream_bytes_sent += total_size;
-        }
+        ++request_id;
         return absl::OkStatus();
       });
+
   if (!s.ok()) {
-    statuses[stream_idx] = s;
-    return;
+    return s;
+  }
+  return requests;
+}
+
+absl::Status BlockTransport::ProcessSocketPush(
+    absl::string_view peer, absl::string_view local_ip,
+    absl::Span<const Request> requests, const std::vector<int>& src_block_ids,
+    const std::vector<int>& dst_block_ids, size_t block_offset,
+    std::vector<int>& allocated_ids) {
+  if (requests.empty()) {
+    return absl::OkStatus();
+  }
+
+  const auto& first = requests.front();
+  const uint8_t socket_opcode = first.socket_opcode;
+  const uint64_t uuid = first.uuid;
+  const uint32_t remote_id = first.remote_id;
+  const uint32_t local_id = first.local_id;
+  const uint32_t count_or_size = first.count_or_size;
+  const int parallelism = first.parallelism;
+  const uint8_t major_order = first.major_order;
+  const size_t block_count = static_cast<size_t>(count_or_size);
+
+  auto status_or_fd = raw_transport_.conn_pool().Borrow(peer, local_ip);
+  if (!status_or_fd.ok()) {
+    return status_or_fd.status();
+  }
+
+  const int fd = status_or_fd.value();
+  bool ok_to_pool = false;
+  auto fd_cleaner = absl::MakeCleanup([&] {
+    raw_transport_.conn_pool().Return(ok_to_pool, fd, peer, local_ip);
+  });
+
+  lib::ChunkHeader header = {};
+  header.version = 1;
+  header.op = socket_opcode;
+  header.flags = major_order;
+  header.buffer_id = 0;
+  header.reserved = static_cast<uint16_t>(parallelism);
+  header.remote_id = remote_id;
+  header.local_id = local_id;
+  header.count_or_size = count_or_size;
+  header.uuid = uuid;
+  const auto s_header = lib::SerializeChunkHeader(header);
+  absl::Status s = WriteExact(fd, s_header.data(), s_header.size());
+  if (!s.ok()) {
+    return s;
+  }
+
+  if (socket_opcode == 6) {
+    ABSL_DCHECK_LE(block_offset + block_count, dst_block_ids.size());
+    s = WriteExact(fd, &dst_block_ids[block_offset], block_count * sizeof(int));
+    if (!s.ok()) {
+      return s;
+    }
+    s = WriteExact(fd, &src_block_ids[block_offset], block_count * sizeof(int));
+    if (!s.ok()) {
+      return s;
+    }
+    uint8_t ack = 0;
+    s = ReadExact(fd, &ack, 1);
+    if (!s.ok() || ack != 1) {
+      return absl::InternalError("Explicit push destination handshake failed");
+    }
+    for (size_t k = 0; k < block_count; ++k) {
+      allocated_ids[block_offset + k] = dst_block_ids[block_offset + k];
+    }
+  } else {
+    s = ReadExact(fd, &allocated_ids[block_offset], block_count * sizeof(int));
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  uint64_t stream_bytes_sent = 0;
+  for (size_t i = 0; i < requests.size();) {
+    size_t j = i;
+    uint32_t total_size = 0;
+    std::vector<struct iovec> iov;
+    while (j < requests.size() &&
+           requests[j].request_id == requests[i].request_id) {
+      total_size += static_cast<uint32_t>(requests[j].len);
+      if (requests[j].len > 0) {
+        iov.push_back(
+            {.iov_base = requests[j].laddr, .iov_len = requests[j].len});
+      }
+      ++j;
+    }
+
+    RETURN_IF_ERROR(WriteExact(fd, &total_size, sizeof(total_size)));
+    if (total_size > 0) {
+      RETURN_IF_ERROR(WriteVExact(fd, absl::MakeSpan(iov)));
+      stream_bytes_sent += total_size;
+    }
+    i = j;
   }
 
   if (stream_bytes_sent > 0) {
@@ -1025,11 +1061,42 @@ void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
   uint8_t ack = 0;
   s = ReadExact(fd, &ack, 1);
   if (!s.ok() || ack != 1) {
-    statuses[stream_idx] = absl::InternalError("Push verification failed");
-    return;
+    return absl::InternalError("Push verification failed");
   }
 
   ok_to_pool = true;
+  return absl::OkStatus();
+}
+
+void BlockTransport::H2hWriteWorker(int stream_idx, absl::string_view peer,
+                                    absl::string_view local_ip,
+                                    size_t block_offset, size_t block_count,
+                                    const std::vector<int>& src_block_ids,
+                                    const std::vector<int>& dst_block_ids,
+                                    std::vector<int>& allocated_ids,
+                                    std::vector<absl::Status>& statuses,
+                                    MajorOrder major_order, uint64_t uuid,
+                                    int layer_idx, int parallelism) {
+  if (block_count > std::numeric_limits<uint32_t>::max()) {
+    statuses[stream_idx] = absl::OutOfRangeError("Block count exceeds uint32");
+    return;
+  }
+
+  auto requests_or = BuildBlockRequests(
+      peer, block_offset, block_count, src_block_ids, dst_block_ids,
+      major_order, uuid, layer_idx, parallelism);
+  if (!requests_or.ok()) {
+    statuses[stream_idx] = requests_or.status();
+    return;
+  }
+
+  absl::Status s =
+      ProcessSocketPush(peer, local_ip, *requests_or, src_block_ids,
+                        dst_block_ids, block_offset, allocated_ids);
+  if (!s.ok()) {
+    statuses[stream_idx] = s;
+    return;
+  }
 }
 
 void BlockTransport::H2hReadWorker(
@@ -1260,9 +1327,10 @@ absl::Status BlockTransport::PushBuffer(absl::string_view peer,
                                         size_t dst_offset_bytes,
                                         const uint8_t* data_ptr,
                                         size_t size_bytes, uint64_t uuid) {
-  absl::Status status =
-      raw_transport_.PushBuffer(peer, buffer_id, dst_shard_idx,
-                                dst_offset_bytes, data_ptr, size_bytes, uuid);
+  ASSIGN_OR_RETURN(
+      auto req, BuildBufferRequest(buffer_id, dst_shard_idx, dst_offset_bytes,
+                                   data_ptr, size_bytes, uuid));
+  absl::Status status = raw_transport_.ProcessSocketBufferPush(peer, req);
   if (!status.ok()) {
     RecordTransferFailure(status, metric_labels::kDirectionPush);
   }
@@ -1276,6 +1344,25 @@ absl::Status BlockTransport::PushBuffers(
     RecordTransferFailure(status, metric_labels::kDirectionPush);
   }
   return status;
+}
+
+absl::StatusOr<Request> BlockTransport::BuildBufferRequest(
+    size_t buffer_id, size_t dst_shard_idx, size_t dst_offset_bytes,
+    const uint8_t* data_ptr, size_t size_bytes, uint64_t uuid) {
+  return Request{
+      .socket_opcode = lib::kOpBufferPush,
+      .laddr = const_cast<uint8_t*>(data_ptr),
+      .raddr = nullptr,
+      .len = size_bytes,
+      .count_or_size = static_cast<uint32_t>(size_bytes),
+      .local_id = static_cast<uint32_t>(dst_shard_idx),
+      .remote_id = static_cast<uint32_t>(dst_offset_bytes),
+      .layer_idx = static_cast<int>(buffer_id),
+      .request_id = 0,
+      .uuid = uuid,
+      .parallelism = 1,
+      .major_order = 0,
+  };
 }
 
 }  // namespace transport

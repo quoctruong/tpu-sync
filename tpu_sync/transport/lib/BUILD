@@ -89,6 +89,7 @@ cc_library(
         ":raw_buffer_transport_delegate",
         "//tpu_sync/core:status_macros",
         "//tpu_sync/transport:buffer_push_task",
+        "//tpu_sync/transport:transport_adapter",
         "//tpu_sync/transport/lib/conn:pool",
         "//tpu_sync/transport/peregrine/src/api:socket_util",
         "@com_google_absl//absl/base:core_headers",
