@@ -24,10 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "net/util/ports.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
@@ -596,6 +598,37 @@ TEST_F(MetricsApiTest, InitializeFromEnvironmentNoOpIfAlreadyInitialized) {
   ScopedEnvironmentVariable env_var(kTelemetryBackendsEnvVar,
                                     "invalid_backend");
   EXPECT_THAT(store_.InitializeFromEnvironment(), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+}
+
+TEST_F(MetricsApiTest, InitializeWithPrometheusPortEnvironmentVariable) {
+  int port = net_util::PickUnusedPortOrDie();
+  std::string port_str = absl::StrCat(port);
+  ScopedEnvironmentVariable port_env(kPrometheusPortEnvVar, port_str.c_str());
+  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+}
+
+TEST_F(MetricsApiTest, InitializeWithPrometheusHostEnvironmentVariable) {
+  int port = net_util::PickUnusedPortOrDie();
+  std::string port_str = absl::StrCat(port);
+  ScopedEnvironmentVariable port_env(kPrometheusPortEnvVar, port_str.c_str());
+  ScopedEnvironmentVariable host_env(kPrometheusHostEnvVar, "127.0.0.1");
+  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+}
+
+TEST_F(MetricsApiTest, InitializeWithInvalidPrometheusPortFallsBackGracefully) {
+  ScopedEnvironmentVariable invalid_port_env(kPrometheusPortEnvVar,
+                                             "invalid_port");
+  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
+  EXPECT_TRUE(store_.HasBackends());
+}
+
+TEST_F(MetricsApiTest,
+       InitializeWithOutOfRangePrometheusPortFallsBackGracefully) {
+  ScopedEnvironmentVariable out_of_range_env(kPrometheusPortEnvVar, "99999");
+  EXPECT_THAT(store_.InitializeFromBackendNames({"prometheus"}), IsOk());
   EXPECT_TRUE(store_.HasBackends());
 }
 

@@ -19,6 +19,7 @@
 #include <thread>  // NOLINT
 #include <vector>
 
+#include "net/util/ports.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/strings/match.h"
@@ -31,12 +32,13 @@ namespace {
 
 using ::testing::HasSubstr;
 
-TEST(PrometheusExporterTest, DefaultHistogramBucketsMatchesMetricsApi) {
-  const prometheus::Histogram::BucketBoundaries& buckets =
-      DefaultHistogramBuckets();
+TEST(PrometheusExporterTest, ExporterOptionsDefaultHistogramBuckets) {
+  ExporterOptions options;
   std::vector<double> expected(std::begin(kDefaultHistogramBuckets),
                                std::end(kDefaultHistogramBuckets));
-  EXPECT_EQ(buckets, expected);
+  std::vector<double> actual(options.custom_buckets.begin(),
+                             options.custom_buckets.end());
+  EXPECT_EQ(actual, expected);
 }
 
 TEST(PrometheusExporterTest, RecordAndExportFormat) {
@@ -113,6 +115,48 @@ TEST(PrometheusExporterTest, ConcurrentMetricUpdates) {
   std::string snapshot = exporter.GetTextSnapshot();
   EXPECT_THAT(snapshot, HasSubstr(absl::StrCat("tpu_raiden_sent_bytes_total ",
                                                kNumThreads * kIterations)));
+}
+
+TEST(PrometheusExporterTest, ServerDisabledWhenPortIsZero) {
+  PrometheusExporter exporter_no_port;
+  EXPECT_FALSE(exporter_no_port.IsServerRunning());
+  EXPECT_EQ(exporter_no_port.GetBoundPort(), 0);
+}
+
+TEST(PrometheusExporterTest, ServerStartsWhenPortConfigured) {
+  int port = net_util::PickUnusedPortOrDie();
+  ExporterOptions options{
+      .bind_address = "127.0.0.1",
+      .port = port,
+  };
+  PrometheusExporter exporter_with_port(options);
+  EXPECT_TRUE(exporter_with_port.IsServerRunning());
+  EXPECT_EQ(exporter_with_port.GetBoundPort(), port);
+}
+
+TEST(PrometheusExporterTest, ServerDisabledWhenPortIsOutOfRange) {
+  ExporterOptions options{
+      .bind_address = "127.0.0.1",
+      .port = 99999,
+  };
+  PrometheusExporter exporter(options);
+  EXPECT_FALSE(exporter.IsServerRunning());
+  EXPECT_EQ(exporter.GetBoundPort(), 0);
+}
+
+TEST(PrometheusExporterTest, ServerHandlesPortCollisionGracefully) {
+  int port = net_util::PickUnusedPortOrDie();
+  ExporterOptions options{
+      .bind_address = "127.0.0.1",
+      .port = port,
+  };
+  PrometheusExporter first_exporter(options);
+  EXPECT_TRUE(first_exporter.IsServerRunning());
+
+  // Second exporter on the same port should fail gracefully without throwing.
+  PrometheusExporter second_exporter(options);
+  EXPECT_FALSE(second_exporter.IsServerRunning());
+  EXPECT_EQ(second_exporter.GetBoundPort(), 0);
 }
 
 }  // namespace
